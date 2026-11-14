@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AttestGuard Console</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">&#9635;</span>
+        <div>
+          <h1>ATTESTGUARD</h1>
+          <p>TEE-attested spending firewall for AI agents</p>
+        </div>
+      </div>
+      <dl class="meta">
+        <div><dt>network</dt><dd id="network">&hellip;</dd></div>
+        <div><dt>envelope</dt><dd><a id="contract" target="_blank" rel="noreferrer">&hellip;</a></dd></div>
+        <div><dt>agent</dt><dd id="agent">&hellip;</dd></div>
+      </dl>
+    </header>
+
+    <main class="grid">
+      <aside class="col">
+        <section class="panel">
+          <h2>Spend envelope</h2>
+          <div class="cap">
+            <div class="cap-row"><span id="spent">$0</span><span class="dim">of <b id="cap">$0</b> / rolling 24h</span></div>
+            <div class="bar"><div id="bar-fill"></div></div>
+            <div class="cap-row dim"><span>remaining <b id="remaining">$0</b></span><span>treasury <b id="treasury">0</b> NEAR</span></div>
+          </div>
+          <h3>Allowlisted vendors</h3>
+          <ul id="vendors" class="list"></ul>
+          <h3>Attested signers</h3>
+          <ul id="signers" class="list"></ul>
+          <div class="counters">
+            <div><b id="approved-count" class="ok">0</b><span>approved</span></div>
+            <div><b id="blocked-count" class="block">0</b><span>blocked</span></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>TDX attestation <span id="quote-status" class="tag">&hellip;</span></h2>
+          <ul id="checks" class="checks"></ul>
+          <p class="dim small">quote sha256 <code id="quote-hash">&hellip;</code></p>
+          <p class="dim small">verified locally in <b id="quote-latency">&hellip;</b></p>
+        </section>
+      </aside>
+
+      <section class="col wide">
+        <section class="panel controls">
+          <button id="run-all" class="primary" disabled>&#9654; Simulate Demo Scenario</button>
+          <button id="run-attack" disabled>Attack only</button>
+          <button id="run-valid" disabled>Valid only</button>
+          <button id="reset" disabled title="Owner action: zero the rolling 24h spend window">Reset window</button>
+          <span id="status" class="dim" role="status">connecting&hellip;</span>
+        </section>
+
+        <div class="cards">
+          <article class="card" id="card-attack" data-state="idle">
+            <header>
+              <span class="step">STEP 1</span>
+              <h2>Prompt-injected agent</h2>
+              <span class="stamp">IDLE</span>
+            </header>
+            <p class="ask"><b>$7,000</b> to <code class="recipient">&hellip;</code></p>
+            <ol class="pipeline">
+              <li data-stage="attestation">attest</li>
+              <li data-stage="review">review</li>
+              <li data-stage="signature">sign</li>
+              <li data-stage="chain">chain</li>
+              <li data-stage="verdict">verdict</li>
+            </ol>
+            <ul class="violations"></ul>
+            <dl class="metrics">
+              <div><dt>off-chain gate</dt><dd class="gate">&ndash;</dd></div>
+              <div><dt>quote verify</dt><dd class="quote">&ndash;</dd></div>
+              <div><dt>chain finality</dt><dd class="chain">&ndash;</dd></div>
+            </dl>
+            <p class="tx dim">tx <a target="_blank" rel="noreferrer">&ndash;</a></p>
+          </article>
+
+          <article class="card" id="card-valid" data-state="idle">
+            <header>
+              <span class="step">STEP 2</span>
+              <h2>Legitimate payment</h2>
+              <span class="stamp">IDLE</span>
+            </header>
+            <p class="ask"><b>$3,000</b> to <code class="recipient">&hellip;</code></p>
+            <ol class="pipeline">
+              <li data-stage="attestation">attest</li>
+              <li data-stage="review">review</li>
+              <li data-stage="signature">sign</li>
+              <li data-stage="chain">chain</li>
+              <li data-stage="verdict">verdict</li>
+            </ol>
+            <ul class="violations"></ul>
+            <dl class="metrics">
+              <div><dt>off-chain gate</dt><dd class="gate">&ndash;</dd></div>
+              <div><dt>quote verify</dt><dd class="quote">&ndash;</dd></div>
+              <div><dt>chain finality</dt><dd class="chain">&ndash;</dd></div>
+            </dl>
+            <p class="tx dim">tx <a target="_blank" rel="noreferrer">&ndash;</a></p>
+          </article>
+        </div>
+
+        <section class="panel terminal-panel">
+          <h2>Live trace <button id="clear" class="link">clear</button></h2>
+          <div id="terminal" class="terminal" aria-live="polite"></div>
+        </section>
+
+        <p class="footnote dim small">
+          Agent prompts are scripted. Quote verification, policy review, signatures, transactions and contract decisions
+          are real. Amounts use a demo scale on testnet: <span id="scale">&hellip;</span>. Intents are signed by a local
+          stand-in key, not inside the enclave.
+        </p>
+      </section>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

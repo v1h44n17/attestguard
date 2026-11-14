@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  contract:
+    name: Contract (fmt, clippy, wasm check, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/attest-guard-envelope
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-near
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/latest/download/cargo-near-installer.sh | sh
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo test
+
+  verifier:
+    name: Verifier (typecheck, tests, latency budget)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verifier
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run bench

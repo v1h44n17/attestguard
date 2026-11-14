@@ -1,0 +1,12 @@
+# Build output
+target/
+node_modules/
+
+# Secrets and local deployment config
+.env
+.env.*
+!.env.example
+
+# OS and editor noise
+.DS_Store
+*.log
