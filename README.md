@@ -60,7 +60,8 @@ make demo                           # both scenarios in the terminal
 make start                          # console at http://localhost:8787, click "Simulate Demo Scenario"
 ```
 
-The console server holds the agent key and listens on `127.0.0.1` only.
+The console server holds the agent key. It listens on `127.0.0.1` only, refuses cross-origin requests and non-loopback
+`Host` headers (CSRF and DNS rebinding), and sends a strict CSP.
 
 ## What is verified, and where
 
@@ -113,10 +114,10 @@ On-chain finality on testnet is a separate 2–5 s.
 - `cargo test`: 34 unit tests (every violation, cap window rollover, nonce replay, tampered amount/vendor/contract,
   high-S and malformed signatures, access control, failed-transfer rollback) plus a sandbox test that deploys the
   real wasm to a local NEAR node and checks balances.
-- `npm test` in `verifier/`: 38 tests, including live captures for both signing algorithms. A shared known-answer vector pins the intent digest and signature to the same
+- `npm test` in `verifier/`: 49 tests: quote verification (including live captures for both signing algorithms), intent signing, policy, scenarios, and the console server's access rules. A shared known-answer vector pins the intent digest and signature to the same
   bytes in Rust and TypeScript.
 
-See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for 17 attacks mapped to the defence and the test that covers each.
+See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for 20 attacks mapped to the defence and the test that covers each.
 
 ## Honest limitations
 

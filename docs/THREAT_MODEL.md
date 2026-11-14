@@ -24,6 +24,12 @@ Every row names the test that exercises it, so each defence can be checked rathe
 | 15 | Vendor account cannot receive funds | Callback returns the spend to the window | contract | `failed_transfer_returns_spend_to_the_window`, sandbox step 9 |
 | 16 | Emergency | Owner pause blocks every proposal | contract | `paused_envelope_blocks_everything` |
 | 17 | Blocked attempts leave no trace | Blocked proposals succeed and emit `EVENT_JSON` with every violation | contract | `prompt_injection_attempt_reports_every_violation_in_an_event` |
+| 18 | A malicious web page in the owner's browser makes the console send transactions (CSRF) | Console refuses cross-origin and cross-site requests; same-origin only | console server | `tests/server.test.ts` ("a page on another site cannot trigger a transaction") |
+| 19 | DNS rebinding points a hostile hostname at the local console | `Host` must be loopback on the server's port | console server | `a rebinding hostname is refused` |
+| 20 | Console files or the agent key leaked via path traversal or framing | Path confinement, strict CSP, `X-Frame-Options: DENY` | console server | `static files cannot escape the frontend directory`, `every response carries the security headers` |
+
+The console rows (18-20) came from a real finding: an earlier build accepted a cross-origin POST and a spoofed `Host`.
+Both were reproduced with `curl`, fixed, and now fail with 403.
 
 ## Not defended (be sceptical of anything that claims otherwise)
 
@@ -36,4 +42,7 @@ Every row names the test that exercises it, so each defence can be checked rathe
 - **A compromised owner key** can raise the cap, add vendors or register signers.
 - **Intel TDX hardware compromise, TCB revocation and the NVIDIA GPU evidence** are not checked.
 - **Allowlisted vendor abuse:** if a vendor is on the allowlist, the agent may pay it up to the cap.
+- **Known dependency advisory:** `npm audit` reports a low-severity `elliptic` issue pulled in transitively by NEAR's
+  `@near-js/*` packages. The only fix is a breaking downgrade of those packages. This project uses them for ed25519 NEAR
+  account keys only; intent signing uses `@noble/curves` and the contract uses the NEAR host's `ecrecover`.
 - The contract is unaudited and runs on testnet only.
