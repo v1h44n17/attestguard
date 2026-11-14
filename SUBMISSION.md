@@ -50,4 +50,8 @@ Honest limits: the owner links the enclave address to the contract (it cannot ve
 
 ## Reply to your own X post (attach demo/attestguard-demo-enclave-mode.mp4)
 
-Update: the approval now comes from the enclave itself. A reviewer model runs inside NEAR AI Cloud's TEE; its key signs the answer; the contract verifies that signature on chain. A forged REJECT->APPROVE edit breaks the signature and is blocked on testnet. 25 attacks mapped to tests: https://github.com/v1h44n17/attestguard/blob/main/docs/THREAT_MODEL.md
+Update: approval now comes from the enclave itself. A reviewer model runs inside NEAR AI Cloud's TEE, its key signs the answer, and the contract verifies that signature on chain. Forge REJECT->APPROVE and it's blocked on testnet.
+
+https://github.com/v1h44n17/attestguard/blob/main/docs/THREAT_MODEL.md
+
+(counts as 254 characters on X; limit 280)
