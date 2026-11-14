@@ -152,7 +152,12 @@ function showResult(card, result) {
     list.replaceChildren(
       el('li', 'pass', '✓ vendor allowlisted'),
       el('li', 'pass', '✓ inside the rolling 24h cap'),
-      el('li', 'pass', '✓ intent signed by an attested key'),
+      ...(state.attestedMode
+        ? [
+            el('li', 'pass', '✓ enclave model answered APPROVE'),
+            el('li', 'pass', '✓ enclave signature verified on chain'),
+          ]
+        : [el('li', 'pass', '✓ intent signed by an attested key')]),
       el('li', 'pass', `✓ ${near(result.amountYocto)} NEAR transferred on chain`),
     );
   }
