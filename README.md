@@ -10,6 +10,27 @@ binds, and **the contract verifies the enclave's signature on chain**.
 
 ![AttestGuard console after a full run on testnet](docs/console.png)
 
+**Demo video and post:** https://x.com/V1H44N/status/2121650502912168438 · **Track:** AI Security & Defense
+(spending limits, policy engine, TEE attestation; also an agent-spending design for Agent Economy).
+
+## Try it in 3 steps
+
+You need Node 24+. No keys, accounts or Rust are needed for steps 1 and 2.
+
+1. **Do:** `git clone https://github.com/v1h44n17/attestguard && cd attestguard/verifier && npm ci && npm test`
+   **See:** `ℹ pass 64`, `ℹ fail 0`. This runs the TDX quote verification, signature and policy tests, including real
+   NEAR AI Cloud reviews captured in `tests/fixtures/`.
+2. **Do:** `npm run attest:live` (still in `verifier/`).
+   **See:** `LIVE ATTESTATION VERIFIED` with 11 passing checks. It fetches a fresh Intel TDX quote from NEAR AI Cloud
+   using a random nonce and verifies it locally.
+3. **Do:** open the live transactions in [Live on NEAR testnet](#live-on-near-testnet).
+   **See:** a `payment_blocked` event (forged approval, unlisted recipient) and a `payment_approved` plus
+   `transfer_settled` event (enclave-signed approval, funds moved).
+
+To run the contract tests as well, install Rust and `cargo-near`, then `cd contracts/attest-guard-envelope && cargo test`
+(53 unit tests plus a sandbox test that deploys the wasm to a local NEAR node). To run the full demo on testnet yourself,
+see [Run it](#run-it).
+
 ```
                     ┌───────────────────────── off-chain verifier (< 1 ms) ──────────────────────────┐
  AI agent ──intent─▶│ 1. verify TDX quote (Intel root → PCK → QE → TD report → RTMR replay → compose) │
@@ -172,6 +193,25 @@ See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for 25 attacks mapped to the de
 - **Settlement is a plain NEAR transfer.** NEAR Intents and Chain Signatures are not integrated.
 - **Not defended:** compromised Intel TDX hardware, stolen owner key. The owner key can raise the cap or add vendors.
 - Contract is unaudited and was built for a hackathon. Testnet only.
+
+## What was built when, and what it is built on
+
+- **Baseline (2026-10-23, before the development window):** design notes, a draft demo script and
+  `docs/sample_attestation.json`, a real attestation fetched from NEAR AI Cloud. No contract or application code existed.
+  Tag: `pre-hackathon`.
+- **Built 2026-11-14:** the contract, the verifier, the console, all tests, the threat model, CI and the deployments.
+  Tag: `hackathon-submission`. Compare the two: https://github.com/v1h44n17/attestguard/compare/pre-hackathon...hackathon-submission
+- **NEAR parts:** the envelope contract (near-sdk), on-chain `ecrecover` verification of NEAR AI Cloud's signature,
+  TDX attestation checks, the NEAR AI Cloud reviewer, and testnet deployments. Nothing here is a port of an existing
+  product on another chain.
+
+**Dependencies:** `near-sdk`, `hex` (contract); `k256`, `sha2`, `sha3`, `near-sandbox`, `near-api`, `cargo-near-build`,
+`tokio` (contract tests only); `@noble/curves`, `@noble/hashes`, `@near-js/accounts`, `@near-js/crypto`,
+`@near-js/keystores`, `@near-js/providers`, `@near-js/signers`, `@near-js/transactions` and TypeScript (verifier).
+The project started from the `cargo-near` contract template; all of its example code was replaced.
+
+**AI assistance:** most of the code, tests and documentation in this repository were written with Claude Code
+(Anthropic), directed and reviewed by the author. The reviewer model that approves demo payments runs on NEAR AI Cloud.
 
 ## Layout
 
