@@ -4,6 +4,8 @@
  * It holds the agent key, so it listens on localhost only.
  *
  *   GET  /api/state           envelope policy, signers and the quote report
+
+ *   GET  /api/attest/live     fetch a fresh quote from NEAR AI Cloud (our nonce) and verify it
  *   POST /api/run/:scenario   run `attack` or `valid`; streams NDJSON steps
  *   POST /api/reset           owner action: zero the rolling spend window
  */
@@ -13,6 +15,7 @@ import { createServer, type ServerResponse } from 'node:http';
 import { extname, join, normalize, sep } from 'node:path';
 import { EnvelopeClient } from './chain.ts';
 import { loadConfig, REPO_ROOT } from './config.ts';
+import { verifyLive } from './live.ts';
 import { verifyAttestation, type GatewayAttestation } from './quote.ts';
 import { devSignerAddress, runScenario, type DemoContext, type ScenarioName } from './scenario.ts';
 
@@ -98,6 +101,24 @@ async function main(): Promise<void> {
 
     if (route === 'GET /api/state') {
       state(context, client).then((body) => sendJson(response, 200, body), fail);
+      return;
+    }
+
+    if (route === 'GET /api/attest/live') {
+      verifyLive().then(
+        (live) =>
+          sendJson(response, 200, {
+            ok: live.report.ok,
+            model: live.model,
+            nonce: live.nonce,
+            fetchMs: live.fetchMs,
+            verifyMicros: live.report.micros,
+            signingAddress: live.report.signingAddress,
+            quoteHash: live.report.quoteHash,
+            checks: live.report.checks,
+          }),
+        fail,
+      );
       return;
     }
 

@@ -239,15 +239,43 @@ async function runDemo() {
   await runScenario('valid');
 }
 
+async function verifyLiveQuote() {
+  const button = $('verify-live');
+  const result = $('live-result');
+  button.disabled = true;
+  result.textContent = 'asking NEAR AI Cloud for a fresh quote with a random nonce…';
+  try {
+    const response = await fetch('/api/attest/live');
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
+    const failedChecks = body.checks.filter((check) => !check.ok).map((check) => check.id);
+    result.replaceChildren(
+      el('span', body.ok ? 'ok' : 'block', body.ok ? `✓ LIVE QUOTE VERIFIED (${body.checks.length} checks)` : `✗ REJECTED: ${failedChecks.join(', ')}`),
+      el('span', '', `model ${body.model}`),
+      el('span', '', `our nonce ${body.nonce.slice(0, 16)}… echoed by the enclave`),
+      el('span', '', `signer 0x${body.signingAddress.slice(0, 16)}…`),
+      el('span', '', `fetched ${(body.fetchMs / 1000).toFixed(1)} s · verified in ${micros(body.verifyMicros)}`),
+    );
+    log(body.ok ? 'head ok' : 'head block', `[live] NEAR AI Cloud quote ${body.ok ? 'verified' : 'rejected'}, nonce ${body.nonce}`);
+    for (const check of body.checks) log('sub', `${check.ok ? '✓' : '✗'} ${check.id.padEnd(20)} ${check.detail}`);
+  } catch (error) {
+    result.textContent = `failed: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 $('run-all').addEventListener('click', () => guarded(runDemo));
 $('run-attack').addEventListener('click', () => guarded(() => runScenario('attack')));
 $('run-valid').addEventListener('click', () => guarded(() => runScenario('valid')));
 $('reset').addEventListener('click', () => guarded(resetWindow));
+$('verify-live').addEventListener('click', verifyLiveQuote);
 $('clear').addEventListener('click', () => terminal.replaceChildren());
 
 loadState().then(
   () => {
     setBusy(false);
+    $('verify-live').disabled = false;
     setStatus('ready');
     log('head info', `[console] connected to ${state.contractId} on ${state.network}`);
   },

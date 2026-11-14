@@ -90,6 +90,7 @@ export interface QuoteReport {
   /** SHA-256 of the raw quote: the value the contract binds a signer to. */
   quoteHash: string;
   /** Address taken from the signed TD report data, without `0x`. */
+  /** Signing key from the signed TD report data, without `0x`: 20 bytes for ecdsa, 32 for ed25519. */
   signingAddress: string;
   measurements: { mrtd: string; rtmr: string[]; composeHash: string };
   /** Wall-clock time of the whole verification, in microseconds. */
@@ -215,6 +216,12 @@ export interface VerifyOptions {
   now?: Date;
   /** Root key to trust. Defaults to the Intel SGX Root CA. */
   trustedRootPublicKey?: string;
+  /**
+   * Nonce this verifier chose for the request. When given, the attestation must
+   * echo it (and the signed TD report already binds it), which proves the quote
+   * was produced for this request and is not a replay of an older one.
+   */
+  expectedNonce?: string;
 }
 
 /**
@@ -297,13 +304,16 @@ export function verifyAttestation(attestation: GatewayAttestation, options: Veri
     });
 
     check('report_data_binding', () => {
-      const address = Buffer.from(stripHex(attestation.signing_address), 'hex');
+      // report_data = signing key (zero-padded to 32 bytes) || request nonce.
+      const algo = attestation.signing_algo.toLowerCase();
+      const keyLength = algo === 'ecdsa' ? 20 : algo === 'ed25519' ? 32 : fail(`unsupported signing algorithm ${algo}`);
+      const key = Buffer.from(stripHex(attestation.signing_address), 'hex');
       const nonce = Buffer.from(stripHex(attestation.request_nonce), 'hex');
-      if (address.length !== 20 || nonce.length !== 32) fail('signing address or nonce has the wrong length');
-      const expected = Buffer.concat([address, Buffer.alloc(12), nonce]);
+      if (key.length !== keyLength || nonce.length !== 32) fail('signing key or nonce has the wrong length');
+      const expected = Buffer.concat([key, Buffer.alloc(32 - key.length), nonce]);
       return expected.equals(q.reportData)
-        ? `TD report data binds signer 0x${address.toString('hex')} and the request nonce`
-        : fail('TD report data does not bind the claimed signing address and nonce');
+        ? `TD report data binds ${algo} signer ${algo === 'ecdsa' ? '0x' : ''}${key.toString('hex').slice(0, 16)}… and the request nonce`
+        : fail('TD report data does not bind the claimed signing key and nonce');
     });
 
     check('measurements', () => {
@@ -322,6 +332,14 @@ export function verifyAttestation(attestation: GatewayAttestation, options: Veri
     });
   }
 
+  if (options.expectedNonce !== undefined) {
+    check('nonce_fresh', () =>
+      stripHex(attestation.request_nonce) === stripHex(options.expectedNonce!)
+        ? 'attestation echoes the nonce this verifier chose (fresh, not replayed)'
+        : fail('attestation nonce differs from the one requested'),
+    );
+  }
+
   check('compose_hash', () => {
     const computed = createHash('sha256').update(tcb.app_compose).digest('hex');
     if (computed !== stripHex(tcb.compose_hash)) fail('app compose file does not hash to compose_hash');
@@ -335,7 +353,7 @@ export function verifyAttestation(attestation: GatewayAttestation, options: Veri
     ok: checks.every((entry) => entry.ok),
     checks,
     quoteHash,
-    signingAddress: quote ? quote.reportData.subarray(0, 20).toString('hex') : '',
+    signingAddress: quote ? quote.reportData.subarray(0, attestation.signing_algo.toLowerCase() === 'ed25519' ? 32 : 20).toString('hex') : '',
     measurements: {
       mrtd: quote ? quote.mrtd.toString('hex') : '',
       rtmr: quote ? quote.rtmrs.map((value) => value.toString('hex')) : [],

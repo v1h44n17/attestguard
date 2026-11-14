@@ -7,6 +7,8 @@ a payment was approved. AttestGuard puts a **spend envelope** contract between t
 leaves the treasury if it fits the owner's policy **and** the exact payment intent was signed by a key that is bound to a
 verified Intel TDX quote.
 
+![AttestGuard console after a full run on testnet](docs/console.png)
+
 ```
                     ┌───────────────────────── off-chain verifier (< 1 ms) ──────────────────────────┐
  AI agent ──intent─▶│ 1. verify TDX quote (Intel root → PCK → QE → TD report → RTMR replay → compose) │
@@ -32,6 +34,7 @@ widen the owner's limits either.
 | | |
 |---|---|
 | Envelope contract | `envelope.attestguard-env-9713.testnet` |
+| Deployed code hash | `Hfn4HfYV42tdkhbXpmBxwQmETQdZwgBcYuP49ER1Bj7g`, identical to the SHA-256 (base58) of the wasm built from this repo (`cargo near build non-reproducible-wasm`, not a reproducible build) |
 | Blocked: $7,000 to an unknown wallet, injected agent | [`5Ec3rJJh…2`](https://testnet.nearblocks.io/txns/5Ec3rJJhfDsTsFDN3PCctKckHUHg7ULZhQZnEpULsJ42) |
 | Approved: $3,000 to the allowlisted vendor, attested | [`Ghrn18Xo…5`](https://testnet.nearblocks.io/txns/Ghrn18XoPdFCYCCHRcUdWFcnx6e65MxLLge1GTdVrw45) |
 
@@ -76,7 +79,21 @@ The console server holds the agent key and listens on `127.0.0.1` only.
 `docs/sample_attestation.json`: quote structure; attestation-key ECDSA signature; Quoting-Enclave report binding; PCK
 chain to the pinned Intel SGX Root CA key and validity dates; PCK signature over the QE report; TD report data binds
 the signer address and nonce; published measurements equal the signed ones; the 28-event log replays to RTMR0–3;
-the app compose file hashes to the measured compose hash. Each check has a test that tampers with exactly that input.
+the app compose file hashes to the measured compose hash; for live quotes, the request nonce is echoed (freshness). Each check has a test that tampers with exactly that input.
+
+## Verified on live NEAR AI Cloud data
+
+The verifier is not tuned to one recorded sample. `npm run attest:live` (or the console's **Verify a live NEAR AI
+quote** button) requests a fresh attestation from `cloud-api.near.ai` with a random 32-byte nonce and checks it
+locally. The signed TD report must bind that exact nonce, so a recording cannot pass.
+
+```bash
+cd verifier && npm run attest:live            # ecdsa
+cd verifier && npm run attest:live -- ed25519 # the gateway's other signing algorithm
+```
+
+Both algorithms verify (11 checks, about 1.5–4 ms locally; the network fetch takes 5–10 s). Captures of both are
+committed in `tests/fixtures/` and replayed in the test suite at their capture time.
 
 ## Performance
 
@@ -96,8 +113,10 @@ On-chain finality on testnet is a separate 2–5 s.
 - `cargo test`: 34 unit tests (every violation, cap window rollover, nonce replay, tampered amount/vendor/contract,
   high-S and malformed signatures, access control, failed-transfer rollback) plus a sandbox test that deploys the
   real wasm to a local NEAR node and checks balances.
-- `npm test` in `verifier/`: 34 tests. A shared known-answer vector pins the intent digest and signature to the same
+- `npm test` in `verifier/`: 38 tests, including live captures for both signing algorithms. A shared known-answer vector pins the intent digest and signature to the same
   bytes in Rust and TypeScript.
+
+See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for 17 attacks mapped to the defence and the test that covers each.
 
 ## Honest limitations
 
@@ -120,5 +139,5 @@ contracts/attest-guard-envelope/   Rust contract, unit tests (src/tests.rs), san
 verifier/                          quote verifier, intent signing, policy mirror, NEAR client, server, demo, bench, deploy
 frontend/                          dependency-free console (index.html, style.css, app.js)
 tests/                             verifier tests (node --test)
-docs/                              architecture, demo script, sample attestation
+docs/                              architecture, threat model, demo script, sample attestation, console screenshot
 ```

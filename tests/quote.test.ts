@@ -142,3 +142,39 @@ test('verification stays inside the 5 ms budget', () => {
   const samples = Array.from({ length: 200 }, () => verifyAttestation(original).micros).sort((a, b) => a - b);
   assert.ok(samples[100]! < 5000, `median ${samples[100]} µs`);
 });
+
+// ---- Live captures from NEAR AI Cloud (2026-11-14), one per signing algorithm.
+// Verified at their capture time so the test does not depend on today's date.
+const LIVE_TIME = new Date('2026-11-14T17:35:00Z');
+const live = (name: string): GatewayAttestation =>
+  (JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')) as {
+    gateway_attestation: GatewayAttestation;
+  }).gateway_attestation;
+
+test('a live ECDSA attestation from NEAR AI Cloud passes every check', () => {
+  const attestation = live('live_ecdsa.json');
+  const report = verifyAttestation(attestation, { now: LIVE_TIME, expectedNonce: attestation.request_nonce });
+  assert.deepEqual(failed(report), []);
+  assert.equal(report.checks.length, 11);
+  assert.equal(report.signingAddress, attestation.signing_address.slice(2).toLowerCase());
+});
+
+test('a live ed25519 attestation binds the 32-byte key and passes every check', () => {
+  const attestation = live('live_ed25519.json');
+  const report = verifyAttestation(attestation, { now: LIVE_TIME, expectedNonce: attestation.request_nonce });
+  assert.deepEqual(failed(report), []);
+  assert.equal(report.signingAddress, attestation.signing_address.toLowerCase());
+  assert.equal(report.signingAddress.length, 64);
+});
+
+test('a replayed attestation fails the freshness check', () => {
+  const attestation = live('live_ecdsa.json');
+  const report = verifyAttestation(attestation, { now: LIVE_TIME, expectedNonce: '00'.repeat(32) });
+  assert.deepEqual(failed(report), ['nonce_fresh']);
+});
+
+test('an unknown signing algorithm is rejected', () => {
+  const attestation = structuredClone(live('live_ecdsa.json'));
+  attestation.signing_algo = 'rsa';
+  assert.deepEqual(failed(verifyAttestation(attestation, { now: LIVE_TIME })), ['report_data_binding']);
+});

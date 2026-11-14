@@ -1,6 +1,6 @@
 CONTRACT := contracts/attest-guard-envelope
 
-.PHONY: setup build test lint bench deploy start demo
+.PHONY: setup build test lint bench attest-live deploy start demo
 
 setup: ## Install verifier dependencies
 	cd verifier && npm ci
@@ -18,6 +18,9 @@ lint: ## Formatting, clippy with warnings denied, wasm check, typecheck
 
 bench: ## Latency of the off-chain gate
 	cd verifier && npm run bench
+
+attest-live: ## Fetch and verify a fresh NEAR AI Cloud quote
+	cd verifier && npm run attest:live
 
 deploy: build ## Deploy to testnet: make deploy MASTER=you.testnet
 	cd verifier && npm run deploy -- $(MASTER)
