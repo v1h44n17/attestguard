@@ -7,7 +7,7 @@ I built AttestGuard at NEAR HACKATHON: a spending firewall for AI agents.
 A prompt-injected agent tries to wire $7K to an unknown wallet. Blocked on-chain, 3 violations logged. A legit $3K
 invoice to an approved vendor settles. Intel TDX quote verified locally in ~1 ms.
 
-Live on testnet. Code: <REPO_LINK>
+Live on testnet. Code: https://github.com/v1h44n17/attestguard
 
 @NEARProtocol #NEARHackathon
 
