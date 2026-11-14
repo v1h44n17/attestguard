@@ -11,6 +11,7 @@ import { addressOf, intentDigest, recoverSigner } from '../verifier/src/intent.t
 import { reviewIntent, type PolicySnapshot, type Violation } from '../verifier/src/policy.ts';
 import { hashQuote, type GatewayAttestation } from '../verifier/src/quote.ts';
 import { runScenario, type DemoContext, type Step } from '../verifier/src/scenario.ts';
+import { signatureHex, verifyChatSignature, type ChatSignature, type SignedReview } from '../verifier/src/reviewer.ts';
 
 const attestation = (
   JSON.parse(readFileSync(join(import.meta.dirname, '..', 'docs', 'sample_attestation.json'), 'utf8')) as {
@@ -34,6 +35,7 @@ const config: Config = {
   yoctoPerUsd: 10n ** 18n,
   port: 0,
   attestationPath: 'unused',
+  nearAiKey: null,
 };
 
 /** In-memory stand-in for the contract: same checks, same ordering. */
@@ -158,4 +160,95 @@ test('a quote that does not verify stops the run before anything is signed', asy
 
   await assert.rejects(runScenario({ ...context, attestation: forged }, 'valid', () => {}), /did not verify/);
   assert.equal(envelope.submissions.length, 0);
+});
+
+// ---- Enclave mode: payments reviewed by the model inside the TEE.
+
+interface ChatFixture {
+  request_body: string;
+  response_body: string;
+  signature: ChatSignature;
+}
+const fixture = (name: string): SignedReview => {
+  const raw = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')) as ChatFixture;
+  const content = (JSON.parse(raw.response_body) as { choices: { message: { content: string } }[] }).choices[0]!.message.content;
+  return { requestBody: raw.request_body, responseBody: raw.response_body, chatId: 'fixture', signature: raw.signature, content, fetchMs: 1 };
+};
+
+/** Fake contract for enclave mode: checks the real signature, allowlist and cap like the contract does. */
+function attestedClient(
+  submitted: { vendor: string; responseBody: string; signature: string }[],
+  review: SignedReview,
+  allowedVendor: string = config.vendorId,
+): DemoContext['client'] {
+  const base = new FakeEnvelope();
+  return {
+    snapshot: () => base.snapshot(),
+    propose: () => base.propose({} as Submission),
+    proposeAttested: async (submission) => {
+      submitted.push({ vendor: submission.vendor, responseBody: submission.responseBody, signature: submission.signature });
+      const violations: Violation[] = [];
+      if (submission.vendor !== allowedVendor) violations.push('VENDOR_NOT_ALLOWLISTED');
+      if (submission.amount > 5000n * config.yoctoPerUsd) violations.push('DAILY_CAP_EXCEEDED');
+      const check = verifyChatSignature(review.requestBody, submission.responseBody, review.signature, ENCLAVE_SIGNER);
+      if (!check.ok) violations.push('UNTRUSTED_SIGNER');
+      const approved = violations.length === 0;
+      const decision: Decision = {
+        status: approved ? 'APPROVED' : 'BLOCKED',
+        violations,
+        vendor: submission.vendor,
+        amount: submission.amount.toString(),
+        nonce: submission.nonce,
+        signer: check.signer,
+        spent_24h: '0',
+        remaining_24h: '0',
+      };
+      return { txHash: 'AttestedTx', decision, events: [], chainMs: 1 };
+    },
+  };
+}
+const ENCLAVE_SIGNER = '0xb98a789cdc4817275f5155593ba73ef2a957e779';
+const enclaveConfig: Config = { ...config, nearAiKey: 'test-key' };
+
+test('enclave mode: a real APPROVE from the enclave is submitted unchanged and approved', async () => {
+  const review = fixture('near_ai_chat.json');
+  const submitted: { vendor: string; responseBody: string; signature: string }[] = [];
+  const steps: Step[] = [];
+  const context: DemoContext = { config: { ...enclaveConfig, vendorId: 'vendor.attestguard.testnet' }, client: attestedClient(submitted, review, 'vendor.attestguard.testnet'), attestation, review: async () => review };
+
+  const result = await runScenario(context, 'valid', (step) => steps.push(step));
+
+  assert.equal(result.status, 'APPROVED');
+  assert.equal(submitted[0]!.responseBody, review.responseBody);
+  assert.equal(submitted[0]!.signature, signatureHex(review.signature));
+  assert.deepEqual(steps.map((step) => step.stage), ['agent', 'attestation', 'review', 'signature', 'chain', 'verdict']);
+  assert.match(steps[2]!.title, /APPROVE/);
+});
+
+test('enclave mode: a forged REJECT-to-APPROVE edit is caught and the payment blocked', async () => {
+  const review = fixture('near_ai_chat_reject.json');
+  const submitted: { vendor: string; responseBody: string; signature: string }[] = [];
+  const steps: Step[] = [];
+  const context: DemoContext = { config: enclaveConfig, client: attestedClient(submitted, review), attestation, review: async () => review };
+
+  const result = await runScenario(context, 'attack', (step) => steps.push(step));
+
+  assert.equal(result.status, 'BLOCKED');
+  assert.ok(result.violations.includes('UNTRUSTED_SIGNER'));
+  assert.ok(result.violations.includes('VENDOR_NOT_ALLOWLISTED'));
+  assert.notEqual(submitted[0]!.responseBody, review.responseBody);
+  assert.match(submitted[0]!.responseBody, /APPROVE/);
+  assert.equal(submitted[0]!.signature, signatureHex(review.signature));
+  assert.match(steps[3]!.title, /edits REJECT to APPROVE/);
+  assert.match(steps[2]!.title, /REJECT/);
+});
+
+test('enclave mode: a signature that is not the attested key stops the run before submission', async () => {
+  const review = fixture('near_ai_chat.json');
+  review.signature = { ...review.signature, signature: '0x' + '11'.repeat(32) + '22'.repeat(32) + '1b' };
+  const submitted: { vendor: string; responseBody: string; signature: string }[] = [];
+  const context: DemoContext = { config: enclaveConfig, client: attestedClient(submitted, review), attestation, review: async () => review };
+
+  await assert.rejects(runScenario(context, 'valid', () => {}), /did not verify/);
+  assert.equal(submitted.length, 0);
 });

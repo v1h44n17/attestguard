@@ -109,6 +109,7 @@ async function state(context: DemoContext, client: ConsoleClient): Promise<objec
     vendorId: config.vendorId,
     attackerId: config.attackerId,
     canReset: client.canAdminister,
+    attestedMode: config.nearAiKey !== null,
     yoctoPerUsd: config.yoctoPerUsd.toString(),
     policy,
     vendors,

@@ -16,6 +16,7 @@ import { DEFAULT_RPC, readNearCredentials, REPO_ROOT } from './config.ts';
 import { addressOf } from './intent.ts';
 import { verifyAttestation, type GatewayAttestation } from './quote.ts';
 import { yoctoToNear } from './scenario.ts';
+import { promptHash, REVIEWER_MODEL } from './reviewer.ts';
 
 const NETWORK = 'testnet';
 const WASM_PATH = join(REPO_ROOT, 'contracts', 'attest-guard-envelope', 'target', 'near', 'attest_guard_envelope.wasm');
@@ -28,7 +29,7 @@ const NEAR = 10n ** 24n;
 const ENVELOPE_FLOAT = (NEAR * 8n) / 100n;
 const AGENT_FUNDS = NEAR / 2n;
 const VENDOR_FUNDS = NEAR / 500n;
-const MASTER_RESERVE = NEAR / 50n;
+const MASTER_RESERVE = NEAR / 20n;
 const GAS = 30_000_000_000_000n;
 
 async function exists(account: Awaited<ReturnType<typeof connectAccounts>>[string]): Promise<boolean> {
@@ -146,6 +147,9 @@ async function main(): Promise<void> {
 
   await step(`register TEE signer 0x${report.signingAddress}`, () =>
     ownerCall('register_signer', { address: report.signingAddress, quote_hash: report.quoteHash }),
+  );
+  await step(`register reviewer ${REVIEWER_MODEL} (prompt sha256 ${promptHash().slice(0, 12)}…)`, () =>
+    ownerCall('set_reviewer', { model: REVIEWER_MODEL, prompt_sha256: promptHash() }),
   );
   await step(`register dev signer 0x${addressOf(devSignerKey)}`, () =>
     ownerCall('register_signer', { address: addressOf(devSignerKey), quote_hash: report.quoteHash }),

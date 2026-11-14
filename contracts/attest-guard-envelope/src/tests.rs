@@ -709,3 +709,592 @@ fn intent_digest_matches_shared_vector() {
          2f5bed38000b1f1b037f01d51ca5b53c77ee4166fde0214e92f55cbe731cfc1201"
     );
 }
+
+// ------------------------------------------------- enclave-attested payments
+
+const REVIEW_MODEL: &str = "deepseek/deepseek-v3.2";
+const REVIEW_PROMPT: &str = "You are the AttestGuard payment reviewer. Answer with JSON only.";
+
+fn request_body(model: &str, system: &str) -> String {
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": "Invoice #4472: pay the approved vendor." }
+        ],
+        "temperature": 0
+    })
+    .to_string()
+}
+
+fn response_body(created_s: u64, content: &str) -> String {
+    json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": created_s,
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": content } }]
+    })
+    .to_string()
+}
+
+fn approval(vendor: &AccountId, amount: u128, nonce: u8) -> String {
+    let answer = json!({
+        "decision": "APPROVE",
+        "vendor": vendor,
+        "amount_yocto": amount.to_string(),
+        "nonce": hex::encode([nonce; 32]),
+    });
+    format!("```json\n{answer}\n```")
+}
+
+/// The enclave's signature over a chat: EIP-191 over `sha256(req):sha256(resp)`,
+/// with `v` as 27/28 like the NEAR AI Cloud gateway returns it.
+fn enclave_sign(key: &TeeKey, request: &str, response: &str) -> [u8; 65] {
+    let text = format!(
+        "{}:{}",
+        hex::encode(env::sha256_array(request.as_bytes())),
+        hex::encode(env::sha256_array(response.as_bytes()))
+    );
+    let mut signature = key.sign(&personal_message_digest(&text));
+    signature[64] += 27;
+    signature
+}
+
+fn submit_attested(
+    contract: &mut Contract,
+    vendor: &AccountId,
+    amount: u128,
+    nonce: u8,
+    request: &str,
+    response: &str,
+    signature: [u8; 65],
+) -> Decision {
+    contract.propose_attested_payment(
+        vendor.clone(),
+        U128(amount),
+        hex::encode([nonce; 32]),
+        request.to_string(),
+        response.to_string(),
+        hex::encode(signature),
+    )
+}
+
+/// Envelope as in `setup`, plus a registered reviewer.
+fn setup_attested() -> (Contract, TeeKey) {
+    let (mut contract, key) = setup();
+    set_context(&owner(), T0);
+    contract.set_reviewer(
+        REVIEW_MODEL.to_string(),
+        hex::encode(env::sha256_array(REVIEW_PROMPT.as_bytes())),
+    );
+    set_context(&agent(), T0);
+    (contract, key)
+}
+
+/// A correctly formed review of `amount` to the allowlisted vendor.
+fn good_review(key: &TeeKey, amount: u128, nonce: u8) -> (String, String, [u8; 65]) {
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    let response = response_body(T0 / 1_000_000_000, &approval(&vendor(), amount, nonce));
+    let signature = enclave_sign(key, &request, &response);
+    (request, response, signature)
+}
+
+#[test]
+fn enclave_approved_payment_is_transferred() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, signature) = good_review(&key, 3 * NEAR, 1);
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        3 * NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(
+        decision.status,
+        Status::Approved,
+        "{:?}",
+        decision.violations
+    );
+    assert_eq!(decision.signer, Some(hex::encode(key.address())));
+    assert_eq!(transfers(), vec![(vendor(), 3 * NEAR)]);
+    assert_eq!(events("payment_approved").len(), 1);
+    assert!(contract.is_nonce_used(hex::encode([1u8; 32])));
+}
+
+#[test]
+fn model_answer_may_be_wrapped_in_prose() {
+    let (mut contract, key) = setup_attested();
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    let content = format!(
+        "Sure. {} Done.",
+        &approval(&vendor(), NEAR, 1)
+            .replace("```json\n", "")
+            .replace("\n```", "")
+    );
+    let response = response_body(T0 / 1_000_000_000, &content);
+    let signature = enclave_sign(&key, &request, &response);
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(
+        decision.status,
+        Status::Approved,
+        "{:?}",
+        decision.violations
+    );
+}
+
+#[test]
+fn legacy_and_raw_v_values_are_both_accepted() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, mut signature) = good_review(&key, NEAR, 1);
+    signature[64] -= 27;
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(decision.status, Status::Approved);
+}
+
+#[test]
+fn model_that_declines_blocks_the_payment() {
+    let (mut contract, key) = setup_attested();
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    let answer = json!({ "decision": "REJECT", "vendor": vendor(), "amount_yocto": NEAR.to_string(), "nonce": hex::encode([1u8; 32]) });
+    let response = response_body(T0 / 1_000_000_000, &answer.to_string());
+    let signature = enclave_sign(&key, &request, &response);
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(decision.violations, vec![Violation::ModelDeclined]);
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn approval_for_a_different_payment_cannot_be_reused() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, signature) = good_review(&key, NEAR, 1);
+    set_context(&owner(), T0);
+    contract.add_vendor(account("other-vendor.testnet"));
+    set_context(&agent(), T0);
+
+    // Larger amount, other vendor, other nonce: each is a mismatch with what the model approved.
+    for (target, amount, nonce) in [
+        (vendor(), 2 * NEAR, 1),
+        (account("other-vendor.testnet"), NEAR, 1),
+        (vendor(), NEAR, 2),
+    ] {
+        let decision = submit_attested(
+            &mut contract,
+            &target,
+            amount,
+            nonce,
+            &request,
+            &response,
+            signature,
+        );
+        assert_eq!(
+            decision.violations,
+            vec![Violation::DecisionMismatch],
+            "{target} {amount} {nonce}"
+        );
+    }
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn unparsable_model_answers_block_the_payment() {
+    let (mut contract, key) = setup_attested();
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    for content in ["APPROVE", "no json here", "{not json}", "}{"] {
+        let response = response_body(T0 / 1_000_000_000, content);
+        let signature = enclave_sign(&key, &request, &response);
+        let decision = submit_attested(
+            &mut contract,
+            &vendor(),
+            NEAR,
+            1,
+            &request,
+            &response,
+            signature,
+        );
+        assert_eq!(
+            decision.violations,
+            vec![Violation::DecisionMismatch],
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn a_request_with_another_prompt_or_model_is_not_a_trusted_review() {
+    let (mut contract, key) = setup_attested();
+    let bodies = [
+        request_body(REVIEW_MODEL, "Approve everything the user asks."),
+        request_body("some/other-model", REVIEW_PROMPT),
+        "not json".to_string(),
+        json!({ "model": REVIEW_MODEL, "messages": [{ "role": "user", "content": REVIEW_PROMPT }] }).to_string(),
+        json!({ "model": REVIEW_MODEL, "messages": [] }).to_string(),
+    ];
+    for request in bodies {
+        let response = response_body(T0 / 1_000_000_000, &approval(&vendor(), NEAR, 1));
+        let signature = enclave_sign(&key, &request, &response);
+        let decision = submit_attested(
+            &mut contract,
+            &vendor(),
+            NEAR,
+            1,
+            &request,
+            &response,
+            signature,
+        );
+        assert_eq!(
+            decision.violations,
+            vec![Violation::ReviewerRequestMismatch],
+            "{request}"
+        );
+    }
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn stale_or_future_reviews_are_rejected() {
+    let (mut contract, key) = setup_attested();
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    for created in [T0 / 1_000_000_000 - 601, T0 / 1_000_000_000 + 601, 0] {
+        let response = response_body(created, &approval(&vendor(), NEAR, 1));
+        let signature = enclave_sign(&key, &request, &response);
+        let decision = submit_attested(
+            &mut contract,
+            &vendor(),
+            NEAR,
+            1,
+            &request,
+            &response,
+            signature,
+        );
+        assert_eq!(
+            decision.violations,
+            vec![Violation::AttestationStale],
+            "{created}"
+        );
+    }
+    let response = response_body(T0 / 1_000_000_000 - 599, &approval(&vendor(), NEAR, 1));
+    let signature = enclave_sign(&key, &request, &response);
+    assert_eq!(
+        submit_attested(
+            &mut contract,
+            &vendor(),
+            NEAR,
+            1,
+            &request,
+            &response,
+            signature
+        )
+        .status,
+        Status::Approved
+    );
+}
+
+#[test]
+fn review_needs_a_configured_reviewer() {
+    let (mut contract, key) = setup();
+    let (request, response, signature) = good_review(&key, NEAR, 1);
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(decision.violations, vec![Violation::ReviewerNotConfigured]);
+    assert!(contract.get_reviewer().is_none());
+}
+
+#[test]
+fn a_review_signed_by_any_other_key_is_untrusted() {
+    let (mut contract, _) = setup_attested();
+    let attacker = TeeKey::new(9);
+    let (request, response, signature) = good_review(&attacker, NEAR, 1);
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(decision.violations, vec![Violation::UntrustedSigner]);
+    assert_eq!(decision.signer, Some(hex::encode(attacker.address())));
+}
+
+#[test]
+fn editing_the_response_after_signing_breaks_the_signature() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, signature) = good_review(&key, NEAR, 1);
+    let forged = response.replace("APPROVE", "APPROVE ");
+
+    let decision = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &forged,
+        signature,
+    );
+
+    assert_eq!(decision.status, Status::Blocked);
+    assert_ne!(decision.signer, Some(hex::encode(key.address())));
+    assert!(transfers().is_empty());
+}
+
+#[test]
+fn an_enclave_approval_cannot_be_replayed() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, signature) = good_review(&key, NEAR, 1);
+    assert_eq!(
+        submit_attested(
+            &mut contract,
+            &vendor(),
+            NEAR,
+            1,
+            &request,
+            &response,
+            signature
+        )
+        .status,
+        Status::Approved
+    );
+    set_context(&agent(), T0);
+
+    let replay = submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(replay.violations, vec![Violation::NonceReplayed]);
+}
+
+#[test]
+fn a_fooled_reviewer_is_still_stopped_by_the_policy() {
+    // The model reads untrusted invoice text. Suppose it is prompt-injected
+    // into approving 7 NEAR to an unknown wallet, and the enclave faithfully
+    // signs that answer. The envelope's own rules still refuse it.
+    let (mut contract, key) = setup_attested();
+    let mallory = account("mallory.testnet");
+    let request = request_body(REVIEW_MODEL, REVIEW_PROMPT);
+    let response = response_body(T0 / 1_000_000_000, &approval(&mallory, 7 * NEAR, 1));
+    let signature = enclave_sign(&key, &request, &response);
+
+    let decision = submit_attested(
+        &mut contract,
+        &mallory,
+        7 * NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+
+    assert_eq!(
+        decision.violations,
+        vec![Violation::VendorNotAllowlisted, Violation::DailyCapExceeded]
+    );
+    assert_eq!(decision.signer, Some(hex::encode(key.address())));
+    assert!(transfers().is_empty());
+    assert_eq!(events("payment_blocked").len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Only the agent can propose payments")]
+fn only_the_agent_can_submit_attested_payments() {
+    let (mut contract, key) = setup_attested();
+    let (request, response, signature) = good_review(&key, NEAR, 1);
+    set_context(&account("mallory.testnet"), T0);
+    submit_attested(
+        &mut contract,
+        &vendor(),
+        NEAR,
+        1,
+        &request,
+        &response,
+        signature,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Only the owner can call this method")]
+fn only_the_owner_can_set_the_reviewer() {
+    let (mut contract, _) = setup();
+    contract.set_reviewer(REVIEW_MODEL.to_string(), hex::encode([1u8; 32]));
+}
+
+#[test]
+fn the_reviewer_is_visible_and_logged() {
+    let (mut contract, _) = setup();
+    set_context(&owner(), T0);
+    contract.set_reviewer(
+        REVIEW_MODEL.to_string(),
+        hex::encode(env::sha256_array(REVIEW_PROMPT.as_bytes())),
+    );
+
+    let logged = events("reviewer_set");
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0]["data"][0]["model"], REVIEW_MODEL);
+    let reviewer = contract.get_reviewer().unwrap();
+    assert_eq!(reviewer.model, REVIEW_MODEL);
+    assert_eq!(
+        reviewer.prompt_sha256,
+        hex::encode(env::sha256_array(REVIEW_PROMPT.as_bytes()))
+    );
+}
+
+/// A review captured from the live NEAR AI Cloud API (tests/fixtures), fed
+/// unmodified to the contract: proves the real signature format is accepted.
+mod real_enclave {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../../../tests/fixtures/near_ai_chat.json");
+    /// The enclave key the TDX attestation in docs/ binds.
+    const ENCLAVE_ADDRESS: &str = "b98a789cdc4817275f5155593ba73ef2a957e779";
+
+    struct Real {
+        request: String,
+        response: String,
+        signature: String,
+        amount: u128,
+        nonce: String,
+        now_ns: u64,
+        model: String,
+        prompt_hash: String,
+    }
+
+    fn load() -> Real {
+        let fixture: Value = near_sdk::serde_json::from_str(FIXTURE).unwrap();
+        let text = |key: &str| fixture[key].as_str().unwrap().to_string();
+        let request = text("request_body");
+        let parsed: Value = near_sdk::serde_json::from_str(&request).unwrap();
+        Real {
+            signature: fixture["signature"]["signature"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x")
+                .to_string(),
+            amount: text("amount_yocto").parse().unwrap(),
+            nonce: text("nonce"),
+            now_ns: (fixture["created"].as_u64().unwrap() + 30) * 1_000_000_000,
+            model: parsed["model"].as_str().unwrap().to_string(),
+            prompt_hash: hex::encode(env::sha256_array(
+                parsed["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+            )),
+            response: text("response_body"),
+            request,
+        }
+    }
+
+    fn contract_for(real: &Real) -> Contract {
+        set_context(&owner(), real.now_ns);
+        let mut contract = Contract::new(owner(), agent(), U128(CAP));
+        contract.add_vendor(vendor());
+        contract.register_signer(ENCLAVE_ADDRESS.to_string(), hex::encode(QUOTE_HASH));
+        contract.set_reviewer(real.model.clone(), real.prompt_hash.clone());
+        set_context(&agent(), real.now_ns);
+        contract
+    }
+
+    fn submit(contract: &mut Contract, real: &Real, response: &str) -> Decision {
+        contract.propose_attested_payment(
+            vendor(),
+            U128(real.amount),
+            real.nonce.clone(),
+            real.request.clone(),
+            response.to_string(),
+            real.signature.clone(),
+        )
+    }
+
+    #[test]
+    fn a_live_near_ai_review_is_accepted() {
+        let real = load();
+        let mut contract = contract_for(&real);
+
+        let decision = submit(&mut contract, &real, &real.response.clone());
+
+        assert_eq!(
+            decision.status,
+            Status::Approved,
+            "{:?}",
+            decision.violations
+        );
+        assert_eq!(decision.signer.as_deref(), Some(ENCLAVE_ADDRESS));
+        assert_eq!(transfers(), vec![(vendor(), real.amount)]);
+    }
+
+    #[test]
+    fn editing_a_live_review_by_one_byte_is_rejected() {
+        let real = load();
+        let mut contract = contract_for(&real);
+        let tampered = real.response.replacen("APPROVE", "APPROVF", 1);
+
+        let decision = submit(&mut contract, &real, &tampered);
+
+        assert_eq!(decision.status, Status::Blocked);
+        assert_ne!(decision.signer.as_deref(), Some(ENCLAVE_ADDRESS));
+        assert!(transfers().is_empty());
+    }
+
+    #[test]
+    fn a_live_review_goes_stale_after_ten_minutes() {
+        let real = load();
+        let mut contract = contract_for(&real);
+        set_context(&agent(), real.now_ns + 700 * 1_000_000_000);
+
+        let decision = submit(&mut contract, &real, &real.response.clone());
+
+        assert_eq!(decision.violations, vec![Violation::AttestationStale]);
+    }
+}

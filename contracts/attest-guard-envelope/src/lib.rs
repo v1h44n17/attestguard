@@ -15,6 +15,7 @@
 
 use near_sdk::json_types::{U64, U128};
 use near_sdk::serde::Serialize;
+use near_sdk::serde_json::Value;
 use near_sdk::store::{IterableSet, LookupMap, LookupSet};
 use near_sdk::{
     AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError, env, near,
@@ -35,6 +36,8 @@ const WINDOW_HOURS: u64 = 24;
 const WINDOW_SLOTS: usize = WINDOW_HOURS as usize;
 const CALLBACK_GAS: Gas = Gas::from_tgas(8);
 const MAX_PAGE: u32 = 100;
+/// An enclave-signed review is only accepted this long after the model produced it.
+const MAX_REVIEW_AGE_NS: u64 = 600_000_000_000;
 /// Domain separator: first line of every signed payment intent.
 pub const INTENT_DOMAIN: &str = "attestguard-intent-v1";
 
@@ -55,6 +58,21 @@ enum StorageKey {
 pub struct SpendBucket {
     hour: u64,
     spent: u128,
+}
+
+/// The model and system prompt the owner trusts to review payments.
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+pub struct ReviewerConfig {
+    model: String,
+    prompt_hash: Hash32,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+pub struct ReviewerView {
+    pub model: String,
+    pub prompt_sha256: String,
 }
 
 #[near(serializers = [borsh])]
@@ -79,6 +97,11 @@ pub enum Violation {
     InvalidSignature,
     UntrustedSigner,
     QuoteHashMismatch,
+    ReviewerNotConfigured,
+    ReviewerRequestMismatch,
+    ModelDeclined,
+    DecisionMismatch,
+    AttestationStale,
 }
 
 #[near(serializers = [json])]
@@ -180,6 +203,7 @@ pub struct Contract {
     vendors: IterableSet<AccountId>,
     used_nonces: LookupSet<Hash32>,
     signers: LookupMap<SignerAddress, SignerRecord>,
+    reviewer: Option<ReviewerConfig>,
     /// Ring buffer of hourly spend, indexed by `hour % 24`. Fixed size, so the
     /// rolling-window sum costs the same no matter how many payments were made.
     window: [SpendBucket; WINDOW_SLOTS],
@@ -200,6 +224,7 @@ impl Contract {
             vendors: IterableSet::new(StorageKey::Vendors),
             used_nonces: LookupSet::new(StorageKey::Nonces),
             signers: LookupMap::new(StorageKey::Signers),
+            reviewer: None,
             window: [SpendBucket::default(); WINDOW_SLOTS],
             approved_count: 0,
             blocked_count: 0,
@@ -229,99 +254,86 @@ impl Contract {
         let nonce_bytes: Hash32 = decode_hex(&nonce, "nonce");
         let quote_hash: Hash32 = decode_hex(&attestation.quote_hash, "quote_hash");
         let signature: [u8; 65] = decode_hex(&attestation.signature, "signature");
-        let amount = amount.0;
-        let now = env::block_timestamp();
-        let hour = now / HOUR_NS;
-        let spent = self.spent_in_window(hour);
-
-        let mut violations = Vec::new();
-        if self.paused {
-            violations.push(Violation::EnvelopePaused);
-        }
-        if amount == 0 {
-            violations.push(Violation::ZeroAmount);
-        }
-        if !self.vendors.contains(&vendor) {
-            violations.push(Violation::VendorNotAllowlisted);
-        }
-        if spent
-            .checked_add(amount)
-            .is_none_or(|total| total > self.daily_cap)
-        {
-            violations.push(Violation::DailyCapExceeded);
-        }
-        if self.used_nonces.contains(&nonce_bytes) {
-            violations.push(Violation::NonceReplayed);
-        }
-        if now > expires_at_ns.0 {
-            violations.push(Violation::IntentExpired);
-        }
-        if amount > self.available_balance() {
-            violations.push(Violation::InsufficientFunds);
-        }
-
         let digest = Intent {
             contract: &env::current_account_id(),
             agent: &self.agent,
             vendor: &vendor,
-            amount,
+            amount: amount.0,
             nonce: &nonce_bytes,
             expires_at_ns: expires_at_ns.0,
             quote_hash: &quote_hash,
         }
         .digest();
         let signer = recover_signer(&digest, &signature);
+        let mut auth = Authorization {
+            signer,
+            violations: Vec::new(),
+        };
         match signer.and_then(|address| self.signers.get(&address)) {
-            None if signer.is_none() => violations.push(Violation::InvalidSignature),
-            None => violations.push(Violation::UntrustedSigner),
+            None if signer.is_none() => auth.violations.push(Violation::InvalidSignature),
+            None => auth.violations.push(Violation::UntrustedSigner),
             Some(record) if record.quote_hash != quote_hash => {
-                violations.push(Violation::QuoteHashMismatch)
+                auth.violations.push(Violation::QuoteHashMismatch)
             }
             Some(_) => {}
         }
+        self.decide(vendor, amount.0, nonce_bytes, Some(expires_at_ns.0), auth)
+    }
 
-        let status = if violations.is_empty() {
-            self.used_nonces.insert(nonce_bytes);
-            self.record_spend(hour, amount);
-            self.approved_count += 1;
-            self.total_paid += amount;
-            Status::Approved
-        } else {
-            self.blocked_count += 1;
-            Status::Blocked
+    /// Propose a payment authorised by the enclave itself.
+    ///
+    /// `request_body` and `response_body` are the exact bytes of a NEAR AI
+    /// Cloud chat completion, and `enclave_signature` is the signature the
+    /// cloud returns for it: an EIP-191 personal signature by the enclave key
+    /// over `sha256(request):sha256(response)`. The contract recomputes both
+    /// hashes, recovers the signer, and requires that signer to be registered.
+    /// It then requires that the request used the owner's registered model and
+    /// system prompt, that the review is recent, and that the model's JSON
+    /// answer is `APPROVE` for exactly this vendor, amount and nonce.
+    ///
+    /// The model reads untrusted invoice text, so its approval is evidence of
+    /// what the enclave decided, not a replacement for the policy checks, which
+    /// still apply in full.
+    pub fn propose_attested_payment(
+        &mut self,
+        vendor: AccountId,
+        amount: U128,
+        nonce: String,
+        request_body: String,
+        response_body: String,
+        enclave_signature: String,
+    ) -> Decision {
+        require!(
+            env::predecessor_account_id() == self.agent,
+            "Only the agent can propose payments"
+        );
+        let nonce_bytes: Hash32 = decode_hex(&nonce, "nonce");
+        let signature: [u8; 65] = decode_hex(&enclave_signature, "enclave_signature");
+        let text = format!(
+            "{}:{}",
+            hex::encode(env::sha256_array(request_body.as_bytes())),
+            hex::encode(env::sha256_array(response_body.as_bytes()))
+        );
+        let signer = recover_signer(&personal_message_digest(&text), &signature);
+        let mut auth = Authorization {
+            signer,
+            violations: Vec::new(),
         };
-        let spent_after = self.spent_in_window(hour);
-        let decision = Decision {
-            status,
-            violations,
-            vendor: vendor.clone(),
-            amount: U128(amount),
-            nonce: hex::encode(nonce_bytes),
-            signer: signer.map(hex::encode),
-            spent_24h: U128(spent_after),
-            remaining_24h: U128(self.daily_cap.saturating_sub(spent_after)),
-        };
-
-        match status {
-            Status::Approved => {
-                emit("payment_approved", self.payment_event(&decision));
-                Promise::new(vendor.clone())
-                    .transfer(NearToken::from_yoctonear(amount))
-                    .then(
-                        Self::ext(env::current_account_id())
-                            .with_static_gas(CALLBACK_GAS)
-                            .on_transfer_settled(
-                                vendor,
-                                U128(amount),
-                                decision.nonce.clone(),
-                                hour,
-                            ),
-                    )
-                    .detach();
+        match signer {
+            None => auth.violations.push(Violation::InvalidSignature),
+            Some(address) if self.signers.get(&address).is_none() => {
+                auth.violations.push(Violation::UntrustedSigner)
             }
-            Status::Blocked => emit("payment_blocked", self.payment_event(&decision)),
+            Some(_) => {}
         }
-        decision
+        auth.violations.extend(self.review_violations(
+            &vendor,
+            amount.0,
+            &hex::encode(nonce_bytes),
+            &request_body,
+            &response_body,
+        ));
+        self.decide(vendor, amount.0, nonce_bytes, None, auth)
     }
 
     /// Transfer callback. If the vendor account could not receive the funds
@@ -417,6 +429,21 @@ impl Contract {
         );
     }
 
+    /// Set the model and system prompt (by SHA-256) whose enclave-signed
+    /// reviews `propose_attested_payment` accepts.
+    pub fn set_reviewer(&mut self, model: String, prompt_sha256: String) {
+        self.assert_owner();
+        let prompt_hash: Hash32 = decode_hex(&prompt_sha256, "prompt_sha256");
+        emit(
+            "reviewer_set",
+            EventData::Reviewer {
+                model: &model,
+                prompt_sha256: hex::encode(prompt_hash),
+            },
+        );
+        self.reviewer = Some(ReviewerConfig { model, prompt_hash });
+    }
+
     pub fn revoke_signer(&mut self, address: String) {
         self.assert_owner();
         let key: SignerAddress = decode_hex(&address, "address");
@@ -476,6 +503,13 @@ impl Contract {
             .take(limit.unwrap_or(MAX_PAGE).min(MAX_PAGE) as usize)
             .cloned()
             .collect()
+    }
+
+    pub fn get_reviewer(&self) -> Option<ReviewerView> {
+        self.reviewer.as_ref().map(|reviewer| ReviewerView {
+            model: reviewer.model.clone(),
+            prompt_sha256: hex::encode(reviewer.prompt_hash),
+        })
     }
 
     pub fn is_vendor(&self, vendor: AccountId) -> bool {
@@ -560,6 +594,153 @@ impl Contract {
         }
     }
 
+    /// Policy checks shared by both entry points, then settlement.
+    /// `expires_at_ns` is `None` when expiry is enforced by review freshness.
+    fn decide(
+        &mut self,
+        vendor: AccountId,
+        amount: u128,
+        nonce_bytes: Hash32,
+        expires_at_ns: Option<u64>,
+        auth: Authorization,
+    ) -> Decision {
+        let now = env::block_timestamp();
+        let hour = now / HOUR_NS;
+        let spent = self.spent_in_window(hour);
+
+        let mut violations = Vec::new();
+        if self.paused {
+            violations.push(Violation::EnvelopePaused);
+        }
+        if amount == 0 {
+            violations.push(Violation::ZeroAmount);
+        }
+        if !self.vendors.contains(&vendor) {
+            violations.push(Violation::VendorNotAllowlisted);
+        }
+        if spent
+            .checked_add(amount)
+            .is_none_or(|total| total > self.daily_cap)
+        {
+            violations.push(Violation::DailyCapExceeded);
+        }
+        if self.used_nonces.contains(&nonce_bytes) {
+            violations.push(Violation::NonceReplayed);
+        }
+        if expires_at_ns.is_some_and(|expiry| now > expiry) {
+            violations.push(Violation::IntentExpired);
+        }
+        if amount > self.available_balance() {
+            violations.push(Violation::InsufficientFunds);
+        }
+        violations.extend(auth.violations);
+        let signer = auth.signer;
+
+        let status = if violations.is_empty() {
+            self.used_nonces.insert(nonce_bytes);
+            self.record_spend(hour, amount);
+            self.approved_count += 1;
+            self.total_paid += amount;
+            Status::Approved
+        } else {
+            self.blocked_count += 1;
+            Status::Blocked
+        };
+        let spent_after = self.spent_in_window(hour);
+        let decision = Decision {
+            status,
+            violations,
+            vendor: vendor.clone(),
+            amount: U128(amount),
+            nonce: hex::encode(nonce_bytes),
+            signer: signer.map(hex::encode),
+            spent_24h: U128(spent_after),
+            remaining_24h: U128(self.daily_cap.saturating_sub(spent_after)),
+        };
+
+        match status {
+            Status::Approved => {
+                emit("payment_approved", self.payment_event(&decision));
+                Promise::new(vendor.clone())
+                    .transfer(NearToken::from_yoctonear(amount))
+                    .then(
+                        Self::ext(env::current_account_id())
+                            .with_static_gas(CALLBACK_GAS)
+                            .on_transfer_settled(
+                                vendor,
+                                U128(amount),
+                                decision.nonce.clone(),
+                                hour,
+                            ),
+                    )
+                    .detach();
+            }
+            Status::Blocked => emit("payment_blocked", self.payment_event(&decision)),
+        }
+        decision
+    }
+
+    /// Everything about the enclave-signed review except its signature:
+    /// registered reviewer, recent, approving exactly this payment.
+    fn review_violations(
+        &self,
+        vendor: &AccountId,
+        amount: u128,
+        nonce_hex: &str,
+        request_body: &str,
+        response_body: &str,
+    ) -> Vec<Violation> {
+        let Some(reviewer) = &self.reviewer else {
+            return vec![Violation::ReviewerNotConfigured];
+        };
+        let mut violations = Vec::new();
+        let request = near_sdk::serde_json::from_str::<Value>(request_body).ok();
+        let system_prompt = request
+            .as_ref()
+            .and_then(|r| r["messages"].get(0))
+            .filter(|m| m["role"] == "system")
+            .and_then(|m| m["content"].as_str());
+        let request_matches = request
+            .as_ref()
+            .is_some_and(|r| r["model"].as_str() == Some(reviewer.model.as_str()))
+            && system_prompt
+                .is_some_and(|prompt| env::sha256_array(prompt.as_bytes()) == reviewer.prompt_hash);
+        if !request_matches {
+            violations.push(Violation::ReviewerRequestMismatch);
+        }
+
+        let response = near_sdk::serde_json::from_str::<Value>(response_body).ok();
+        let created_ns = response
+            .as_ref()
+            .and_then(|r| r["created"].as_u64())
+            .and_then(|seconds| seconds.checked_mul(1_000_000_000));
+        if created_ns
+            .is_none_or(|created| env::block_timestamp().abs_diff(created) > MAX_REVIEW_AGE_NS)
+        {
+            violations.push(Violation::AttestationStale);
+        }
+
+        let answer = response
+            .as_ref()
+            .and_then(|r| r["choices"].get(0))
+            .and_then(|choice| choice["message"]["content"].as_str())
+            .and_then(extract_json_object);
+        match answer {
+            None => violations.push(Violation::DecisionMismatch),
+            Some(answer) => {
+                if answer["decision"].as_str() != Some("APPROVE") {
+                    violations.push(Violation::ModelDeclined);
+                } else if answer["vendor"].as_str() != Some(vendor.as_str())
+                    || answer["amount_yocto"].as_str() != Some(amount.to_string().as_str())
+                    || answer["nonce"].as_str() != Some(nonce_hex)
+                {
+                    violations.push(Violation::DecisionMismatch);
+                }
+            }
+        }
+        violations
+    }
+
     fn record_spend(&mut self, hour: u64, amount: u128) {
         let bucket = &mut self.window[slot(hour)];
         if bucket.hour != hour {
@@ -586,6 +767,28 @@ pub fn recover_signer(digest: &Hash32, signature: &[u8; 65]) -> Option<SignerAdd
     let mut address = [0u8; 20];
     address.copy_from_slice(&hash[12..]);
     Some(address)
+}
+
+/// Outcome of checking who authorised a payment.
+struct Authorization {
+    signer: Option<SignerAddress>,
+    violations: Vec<Violation>,
+}
+
+/// EIP-191 `personal_sign` digest of `message`.
+pub fn personal_message_digest(message: &str) -> Hash32 {
+    env::keccak256_array(
+        format!("\x19Ethereum Signed Message:\n{}{message}", message.len()).as_bytes(),
+    )
+}
+
+/// The first complete `{...}` span of a model answer, parsed as JSON. Lets a
+/// model wrap its answer in a code fence or a sentence; anything that does not
+/// parse is treated as no answer at all.
+fn extract_json_object(content: &str) -> Option<Value> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    near_sdk::serde_json::from_str(content.get(start..=end)?).ok()
 }
 
 /// Decode fixed-length hex, with or without a `0x` prefix. Panics on bad input.
@@ -632,6 +835,10 @@ enum EventData<'a> {
     },
     Paused {
         paused: bool,
+    },
+    Reviewer {
+        model: &'a str,
+        prompt_sha256: String,
     },
     Signer {
         address: String,

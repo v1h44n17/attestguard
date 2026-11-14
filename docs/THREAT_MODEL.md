@@ -27,16 +27,22 @@ Every row names the test that exercises it, so each defence can be checked rathe
 | 18 | A malicious web page in the owner's browser makes the console send transactions (CSRF) | Console refuses cross-origin and cross-site requests; same-origin only | console server | `tests/server.test.ts` ("a page on another site cannot trigger a transaction") |
 | 19 | DNS rebinding points a hostile hostname at the local console | `Host` must be loopback on the server's port | console server | `a rebinding hostname is refused` |
 | 20 | Console files or the agent key leaked via path traversal or framing | Path confinement, strict CSP, `X-Frame-Options: DENY` | console server | `static files cannot escape the frontend directory`, `every response carries the security headers` |
+| 21 | Agent edits the model's REJECT into an APPROVE | Enclave signature covers the exact response bytes; the contract recovers another signer | contract | `editing_the_response_after_signing_breaks_the_signature`, `editing_a_live_review_by_one_byte_is_rejected` (real NEAR AI review), live tx `3tfJBRg8…` |
+| 22 | Agent asks the model a friendlier question, or another model | Contract requires the registered model and system-prompt hash in the signed request | contract | `a_request_with_another_prompt_or_model_is_not_a_trusted_review` |
+| 23 | Reuse an enclave approval for another vendor, amount or nonce | Contract requires the answer to echo this exact payment | contract | `approval_for_a_different_payment_cannot_be_reused` |
+| 24 | Replay an old enclave approval | 10-minute freshness window on the model response, plus one-time nonces | contract | `stale_or_future_reviews_are_rejected`, `an_enclave_approval_cannot_be_replayed` |
+| 25 | The reviewer model is prompt-injected into approving a bad payment | Allowlist, cap and nonce rules apply regardless of the model | contract | `a_fooled_reviewer_is_still_stopped_by_the_policy` |
 
 The console rows (18-20) came from a real finding: an earlier build accepted a cross-origin POST and a spoofed `Host`.
 Both were reproduced with `curl`, fixed, and now fail with 403.
 
 ## Not defended (be sceptical of anything that claims otherwise)
 
-- **Enclave-held signing key.** The key that signs intents is a stand-in held by the verifier, not generated inside the
-  enclave, because NEAR AI Cloud has no hook for signing arbitrary intents. The contract trusts whatever signer the
-  *owner* registers against a quote hash. So the attestation proves a genuine enclave exists and the owner linked it;
-  it does not prove that enclave approved each payment.
+- **Owner-made link between quote and signer.** The contract cannot verify a TDX quote, so it trusts the enclave
+  address the *owner* registers after the verifier checks the quote. In enclave mode the signed model answer does come
+  from the attested gateway key; the fallback mode (no `NEAR_AI_API_KEY`) uses a stand-in key instead.
+- **The model can be fooled** by untrusted invoice text; its approval is evidence of what the enclave decided, and the
+  policy checks are the backstop.
 - **A compromised verifier host** holds the stand-in key and could sign out-of-policy intents. The contract still
   enforces the allowlist, cap, nonce and expiry on its own, so the damage is bounded by the owner's envelope.
 - **A compromised owner key** can raise the cap, add vendors or register signers.

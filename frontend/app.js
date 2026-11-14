@@ -49,7 +49,11 @@ function renderState() {
   fill.classList.toggle('high', cap !== 0n && spent * 2n > cap);
   $('approved-count').textContent = policy.approved_count;
   $('blocked-count').textContent = policy.blocked_count;
-  $('scale').textContent = `$1 = ${near(state.yoctoPerUsd, 6)} NEAR`;
+  $('footnote').textContent = state.attestedMode
+    ? `Enclave mode: each invoice is reviewed by a model running inside NEAR AI Cloud's TEE, and the contract verifies the enclave's own signature on chain. ` +
+      `Quote verification, signatures, transactions and contract decisions are real. Amounts use a demo scale on testnet: $1 = ${near(state.yoctoPerUsd, 6)} NEAR.`
+    : `Agent prompts are scripted. Quote verification, policy review, signatures, transactions and contract decisions are real. ` +
+      `Amounts use a demo scale on testnet: $1 = ${near(state.yoctoPerUsd, 6)} NEAR. Intents are signed by a local stand-in key, not inside the enclave.`;
 
   $('vendors').replaceChildren(...state.vendors.map((vendor) => el('li', '', vendor)));
   $('signers').replaceChildren(
@@ -58,7 +62,9 @@ function renderState() {
       const role =
         signer.role === 'tee'
           ? 'NEAR AI Cloud enclave key, bound by the TDX report data'
-          : 'demo stand-in key (not inside a TEE)';
+          : state.attestedMode
+            ? 'demo stand-in key (unused in enclave mode)'
+            : 'demo stand-in key (not inside a TEE)';
       item.append(el('span', 'note', `${role}${signer.registered ? '' : ' · not registered on chain'}`));
       return item;
     }),

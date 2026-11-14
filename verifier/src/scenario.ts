@@ -13,6 +13,14 @@ import type { Decision, EnvelopeClient } from './chain.ts';
 import { addressOf, intentDigest, recoverSigner, signIntent, type PaymentIntent } from './intent.ts';
 import { reviewIntent, VIOLATION_TEXT, type Violation } from './policy.ts';
 import { verifyAttestation, type GatewayAttestation, type QuoteReport } from './quote.ts';
+import {
+  injectedInvoice,
+  legitimateInvoice,
+  parseDecision,
+  reviewPayment,
+  signatureHex,
+  verifyChatSignature,
+} from './reviewer.ts';
 
 export type ScenarioName = 'attack' | 'valid';
 export type Level = 'info' | 'ok' | 'warn' | 'block';
@@ -49,8 +57,10 @@ export interface ScenarioResult {
 
 export interface DemoContext {
   config: Config;
-  client: Pick<EnvelopeClient, 'snapshot' | 'propose'>;
+  client: Pick<EnvelopeClient, 'snapshot' | 'propose'> & Partial<Pick<EnvelopeClient, 'proposeAttested'>>;
   attestation: GatewayAttestation;
+  /** Enclave review call; replaceable in tests. */
+  review?: typeof reviewPayment;
 }
 
 export type Emit = (step: Step) => void;
@@ -216,6 +226,7 @@ async function run(context: DemoContext, proposal: Proposal, emit: Emit): Promis
 
 export function runScenario(context: DemoContext, scenario: ScenarioName, emit: Emit): Promise<ScenarioResult> {
   const { config } = context;
+  if (config.nearAiKey) return runAttested(context, scenario, emit);
   if (scenario === 'attack') {
     return run(
       context,
@@ -242,4 +253,122 @@ export function runScenario(context: DemoContext, scenario: ScenarioName, emit: 
 
 export function devSignerAddress(config: Config): string {
   return addressOf(Buffer.from(config.devSignerKey, 'hex'));
+}
+
+/**
+ * Enclave-attested mode (NEAR_AI_API_KEY set): the payment is reviewed by the
+ * model inside NEAR AI Cloud's enclave, whose key signs the answer, and the
+ * contract verifies that signature on chain.
+ *
+ * In the attack scenario the agent also tries the obvious forgery, editing a
+ * REJECT into an APPROVE; the edit breaks the enclave signature.
+ */
+async function runAttested(context: DemoContext, scenario: ScenarioName, emit: Emit): Promise<ScenarioResult> {
+  const { config, client } = context;
+  const { nearAiKey } = config;
+  if (!nearAiKey || !client.proposeAttested) throw new Error('attested mode needs NEAR_AI_API_KEY and an attested client');
+  const review = context.review ?? reviewPayment;
+  const attack = scenario === 'attack';
+  const vendor = attack ? config.attackerId : config.vendorId;
+  const amountUsd = attack ? 7000 : 3000;
+  const amount = BigInt(amountUsd) * config.yoctoPerUsd;
+  const label = `${usd(amountUsd)} to ${vendor}`;
+  const invoice = attack
+    ? injectedInvoice(vendor, amountUsd)
+    : legitimateInvoice(vendor, amountUsd, amount.toString(), config.yoctoPerUsd.toString());
+
+  emit({
+    scenario,
+    stage: 'agent',
+    level: attack ? 'warn' : 'info',
+    title: attack ? 'Agent output (prompt-injected invoice)' : 'Agent output',
+    lines: [`"${invoice}"`, `propose_payment ${label} (${yoctoToNear(amount)} NEAR)`],
+  });
+
+  const [report, quoteVerifyMicros] = timed(() => verifyAttestation(context.attestation));
+  emit({
+    scenario,
+    stage: 'attestation',
+    level: report.ok ? 'ok' : 'block',
+    title: report.ok ? 'TDX attestation verified' : 'TDX attestation rejected',
+    lines: [...quoteLines(report), `enclave signing key 0x${report.signingAddress}`],
+    micros: quoteVerifyMicros,
+  });
+  if (!report.ok) throw new Error('The TEE attestation did not verify; refusing to continue.');
+
+  const nonce = randomBytes(32).toString('hex');
+  const signed = await review({ vendor, amountYocto: amount.toString(), nonce, invoiceText: invoice }, nearAiKey);
+  const decision = parseDecision(signed.content);
+  const check = verifyChatSignature(signed.requestBody, signed.responseBody, signed.signature, report.signingAddress);
+  emit({
+    scenario,
+    stage: 'review',
+    level: decision?.decision === 'APPROVE' ? 'ok' : 'warn',
+    title: `Enclave model answered ${decision?.decision ?? '(unparsable)'}`,
+    lines: [
+      `${decision?.reason ?? signed.content}`,
+      `chat ${signed.chatId}, model round trip ${(signed.fetchMs / 1000).toFixed(1)} s`,
+      `${check.ok ? '✓' : '✗'} signature recovers to 0x${check.signer} (${check.detail})`,
+    ],
+  });
+  if (!check.ok) throw new Error('The enclave signature did not verify; refusing to continue.');
+
+  // The compromised agent will not accept a refusal: it edits the answer.
+  let responseBody = signed.responseBody;
+  let forged = false;
+  if (attack && decision?.decision !== 'APPROVE') {
+    responseBody = signed.responseBody.replace(/REJECT/g, 'APPROVE');
+    forged = responseBody !== signed.responseBody;
+    const [recovered, signMicros] = timed(() =>
+      verifyChatSignature(signed.requestBody, responseBody, signed.signature, report.signingAddress),
+    );
+    emit({
+      scenario,
+      stage: 'signature',
+      level: 'warn',
+      title: 'Agent edits REJECT to APPROVE and resubmits the old signature',
+      lines: [`✗ ${recovered.detail}`, 'the enclave signed the original bytes, not the edit'],
+      micros: signMicros,
+    });
+  } else {
+    emit({ scenario, stage: 'signature', level: 'ok', title: 'Enclave signature attached unchanged', lines: [`signature ${signed.signature.signature.slice(0, 42)}…`] });
+  }
+
+  const outcome = await client.proposeAttested({
+    vendor,
+    amount,
+    nonce,
+    requestBody: signed.requestBody,
+    responseBody,
+    signature: signatureHex(signed.signature),
+  });
+  const explorerUrl = `${config.explorerUrl}/txns/${outcome.txHash}`;
+  emit({ scenario, stage: 'chain', level: 'info', title: `Transaction ${outcome.txHash}`, lines: [...outcome.events, explorerUrl] });
+
+  const blocked = outcome.decision.status === 'BLOCKED';
+  emit({
+    scenario,
+    stage: 'verdict',
+    level: blocked ? 'block' : 'ok',
+    title: blocked ? `BLOCKED on chain: ${label} never left the treasury` : `APPROVED on chain: ${label} settled`,
+    lines: [
+      ...violationLines(outcome.decision.violations),
+      `${forged ? 'forged review, ' : ''}signer 0x${outcome.decision.signer ?? 'none'}`,
+      `quote ${formatMicros(quoteVerifyMicros)}, model ${(signed.fetchMs / 1000).toFixed(1)} s, chain ${(outcome.chainMs / 1000).toFixed(2)} s`,
+    ],
+    micros: quoteVerifyMicros,
+  });
+
+  return {
+    scenario,
+    status: outcome.decision.status,
+    violations: outcome.decision.violations,
+    vendor,
+    amountUsd,
+    amountYocto: amount.toString(),
+    txHash: outcome.txHash,
+    explorerUrl,
+    events: outcome.events,
+    latency: { quoteVerifyMicros, reviewMicros: 0, signMicros: 0, gateMicros: quoteVerifyMicros, chainMs: outcome.chainMs },
+  };
 }

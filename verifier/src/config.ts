@@ -21,6 +21,8 @@ export interface Config {
   yoctoPerUsd: bigint;
   port: number;
   attestationPath: string;
+  /** NEAR AI Cloud API key. When set, payments are reviewed by the enclave-hosted model. */
+  nearAiKey: string | null;
 }
 
 function required(name: string): string {
@@ -65,5 +67,6 @@ export function loadConfig(): Config {
     yoctoPerUsd: BigInt(process.env.YOCTO_PER_USD ?? '1000000000000000000'),
     port: Number(process.env.PORT ?? 8787),
     attestationPath: process.env.ATTESTATION_PATH ?? join(REPO_ROOT, 'docs', 'sample_attestation.json'),
+    nearAiKey: process.env.NEAR_AI_API_KEY || null,
   };
 }

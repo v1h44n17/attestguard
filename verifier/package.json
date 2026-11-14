@@ -10,6 +10,7 @@
     "demo": "node --env-file-if-exists=.env src/demo.ts",
     "bench": "node src/bench.ts",
     "attest:live": "node src/live.ts",
+    "review": "node --env-file-if-exists=.env src/review-cli.ts",
     "deploy": "node src/deploy.ts",
     "test": "node --test ../tests/*.test.ts",
     "typecheck": "tsc --noEmit"

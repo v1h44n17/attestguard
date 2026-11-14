@@ -82,6 +82,17 @@ export interface Submission {
   signature: string;
 }
 
+export interface AttestedSubmission {
+  vendor: string;
+  amount: bigint;
+  nonce: string;
+  /** Exact bytes of the chat request and response the enclave signed. */
+  requestBody: string;
+  responseBody: string;
+  /** Contract-ready hex of the enclave's chat signature. */
+  signature: string;
+}
+
 export interface ProposalOutcome {
   txHash: string;
   decision: Decision;
@@ -167,24 +178,44 @@ export class EnvelopeClient {
   }
 
   /** Submit a proposal as the agent and wait for the contract's decision. */
-  async propose(submission: Submission): Promise<ProposalOutcome> {
+  propose(submission: Submission): Promise<ProposalOutcome> {
+    return this.send('propose_payment', {
+      vendor: submission.vendor,
+      amount: submission.amount.toString(),
+      nonce: submission.nonce,
+      expires_at_ns: submission.expiresAtNs.toString(),
+      attestation: { quote_hash: submission.quoteHash, signature: submission.signature },
+    });
+  }
+
+  /** Submit a payment authorised by an enclave-signed review. */
+  proposeAttested(submission: AttestedSubmission): Promise<ProposalOutcome> {
+    return this.send('propose_attested_payment', {
+      vendor: submission.vendor,
+      amount: submission.amount.toString(),
+      nonce: submission.nonce,
+      request_body: submission.requestBody,
+      response_body: submission.responseBody,
+      enclave_signature: submission.signature,
+    });
+  }
+
+  reviewer(): Promise<{ model: string; prompt_sha256: string } | null> {
+    return this.view('get_reviewer');
+  }
+
+  private async send(methodName: string, args: object): Promise<ProposalOutcome> {
     const started = performance.now();
     const outcome: TxOutcome = await this.agent.functionCall({
       contractId: this.contractId,
-      methodName: 'propose_payment',
-      args: {
-        vendor: submission.vendor,
-        amount: submission.amount.toString(),
-        nonce: submission.nonce,
-        expires_at_ns: submission.expiresAtNs.toString(),
-        attestation: { quote_hash: submission.quoteHash, signature: submission.signature },
-      },
+      methodName,
+      args,
       gas: PROPOSE_GAS,
     });
     const chainMs = performance.now() - started;
     const status = outcome.status;
     if (typeof status.SuccessValue !== 'string') {
-      throw new Error(`propose_payment failed: ${JSON.stringify(outcome.status)}`);
+      throw new Error(`${methodName} failed: ${JSON.stringify(outcome.status)}`);
     }
     return {
       txHash: outcome.transaction.hash,
@@ -205,6 +236,10 @@ export class EnvelopeClient {
       gas: ADMIN_GAS,
     });
     return outcome.transaction.hash;
+  }
+
+  setReviewer(model: string, promptSha256: string): Promise<string> {
+    return this.ownerCall('set_reviewer', { model, prompt_sha256: promptSha256 });
   }
 
   registerSigner(address: string, quoteHash: string): Promise<string> {

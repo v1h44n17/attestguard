@@ -32,6 +32,7 @@ const config: Config = {
   yoctoPerUsd: 10n ** 18n,
   port: 0,
   attestationPath: 'unused',
+  nearAiKey: null,
 };
 
 let resets = 0;
